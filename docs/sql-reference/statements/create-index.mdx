@@ -126,6 +126,8 @@ CREATE INDEX idx_items_total ON items (quantity * unit_price);
 
 Each expression in the index must be a deterministic expression that references only columns of the indexed table. Aggregate functions and subqueries are not allowed.
 
+A database created by SQLite or libSQL can contain an expression index that calls a function Turso does not have, such as an application-defined function or a libSQL vector index (`libsql_vector_idx`). Turso opens such a database and reads it normally, but statements that must compute that index's keys, such as an `INSERT` into the indexed table, fail with `no such function`. Drop the index to make the table writable again.
+
 ## Custom Index Methods {#using-method}
 
 <Info>

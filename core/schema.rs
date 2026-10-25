@@ -6508,7 +6508,7 @@ impl Index {
                 ..
             })) => {
                 let index_name = normalize_ident(idx_name.name.as_str());
-                let index_columns = resolve_sorted_columns(table, &columns)?;
+                let index_columns = resolve_sorted_columns(syms, table, &columns)?;
                 if let Some(using) = using {
                     if where_clause.is_some() {
                         bail_parse_error!("custom index module do not support partial indices");

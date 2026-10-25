@@ -1,3 +1,4 @@
+use crate::common::{limbo_exec_rows, rusqlite_integrity_check, sqlite_exec_rows};
 use asserting::prelude::*;
 use std::sync::Arc;
 use turso::IoBackend;
@@ -168,6 +169,80 @@ fn test_open_refuses_file_with_unknown_virtual_table_module() {
         }
         Err(other) => panic!("expected missing fts5 module error, got {other:?}"),
         Ok(_) => panic!("expected missing fts5 module error, got a successful open"),
+    }
+}
+
+/// SQLite opens a file whose index calls a function it does not know, such as
+/// a libSQL vector index (`libsql_vector_idx(...)`), and fails only the
+/// statements that must compute that index's keys. Turso must do the same:
+/// the rest of the file stays usable, and writes to the indexed table fail
+/// instead of leaving the index stale.
+#[test]
+fn test_open_file_with_index_on_unknown_function() {
+    let tmp_dir = tempfile::TempDir::new().unwrap();
+    let path = tmp_dir.path().join("unknown_function_index.db");
+    let sqlite = rusqlite::Connection::open(&path).unwrap();
+    sqlite
+        .execute_batch(
+            "CREATE TABLE t(x); CREATE INDEX t_idx ON t(abs(x)); INSERT INTO t VALUES(1);
+             CREATE TABLE z(y); INSERT INTO z VALUES(2);
+             PRAGMA writable_schema = ON;
+             UPDATE sqlite_schema SET sql = 'CREATE INDEX t_idx ON t(app_func(x))'
+              WHERE name = 't_idx';",
+        )
+        .unwrap();
+    drop(sqlite);
+
+    let db = open_plain_file(&path).unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    assert_that!(limbo_exec_rows(&conn, "SELECT x FROM t")).is_equal_to(vec![row![1]]);
+    conn.execute("INSERT INTO z VALUES(3)").unwrap();
+    for sql in [
+        "INSERT INTO t VALUES(4)",
+        "UPDATE t SET x = 5",
+        "DELETE FROM t WHERE x = 1",
+    ] {
+        let err = conn.execute(sql).unwrap_err();
+        assert_that!(err.to_string())
+            .named(sql)
+            .contains("no such function: app_func");
+    }
+    conn.execute("DROP INDEX t_idx").unwrap();
+    conn.execute("INSERT INTO t VALUES(4)").unwrap();
+    drop(conn);
+    drop(db);
+
+    rusqlite_integrity_check(&path).unwrap();
+    let sqlite = rusqlite::Connection::open(&path).unwrap();
+    assert_that!(sqlite_exec_rows(&sqlite, "SELECT x FROM t ORDER BY x"))
+        .is_equal_to(vec![row![1], row![4]]);
+    assert_that!(sqlite_exec_rows(&sqlite, "SELECT y FROM z ORDER BY y"))
+        .is_equal_to(vec![row![2], row![3]]);
+}
+
+/// A function Turso does know must still be deterministic in a stored index.
+/// Accepting uuid4_str() would let writes store random index keys.
+#[test]
+fn test_open_refuses_file_with_index_on_nondeterministic_function() {
+    let tmp_dir = tempfile::TempDir::new().unwrap();
+    let path = tmp_dir.path().join("nondeterministic_index.db");
+    let sqlite = rusqlite::Connection::open(&path).unwrap();
+    sqlite
+        .execute_batch(
+            "CREATE TABLE t(x); CREATE INDEX t_idx ON t(abs(x));
+             PRAGMA writable_schema = ON;
+             UPDATE sqlite_schema SET sql = 'CREATE INDEX t_idx ON t(uuid4_str(), x)'
+              WHERE name = 't_idx';",
+        )
+        .unwrap();
+    drop(sqlite);
+
+    match open_plain_file(&path) {
+        Err(turso_core::LimboError::ParseError(msg)) => {
+            assert_that!(msg).contains("invalid expression in CREATE INDEX");
+        }
+        Err(other) => panic!("expected invalid index expression error, got {other:?}"),
+        Ok(_) => panic!("expected invalid index expression error, got a successful open"),
     }
 }
 

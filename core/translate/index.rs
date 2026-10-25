@@ -1,6 +1,6 @@
 use crate::alloc::{TryClone, TursoIteratorExt, TursoVecExt};
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
-use crate::function::Func;
+use crate::function::{Deterministic, Func};
 use crate::index_method::IndexMethodConfiguration;
 use crate::numeric::Numeric;
 use crate::schema::{Column, GeneratedType, Table, EXPR_INDEX_SENTINEL, RESERVED_TABLE_PREFIXES};
@@ -20,7 +20,9 @@ use crate::translate::{
 };
 use crate::vdbe::builder::{CursorKey, ProgramBuilderOpts, SelfTableContext};
 use crate::vdbe::insn::{to_u32, ClearBtreeCount, CmpInsFlags, Cookie};
-use crate::{bail_parse_error, CaptureDataChangesExt, LimboError, MAIN_DB_ID, TEMP_DB_ID};
+use crate::{
+    bail_parse_error, CaptureDataChangesExt, LimboError, SymbolTable, MAIN_DB_ID, TEMP_DB_ID,
+};
 use crate::{
     schema::{
         is_deterministic_schema_function_call, BTreeTable, Index, IndexColumn, PseudoCursorType,
@@ -165,7 +167,12 @@ pub fn translate_create_index(
     if !tbl.has_rowid {
         bail_parse_error!("CREATE INDEX on WITHOUT ROWID tables is not supported");
     }
-    let columns = resolve_sorted_columns_with_resolver(&tbl, &columns, Some(resolver))?;
+    let columns = resolve_sorted_columns_with_resolver(
+        &tbl,
+        &columns,
+        Some(resolver),
+        IndexFunctions::CreateIndex,
+    )?;
 
     // Block CREATE INDEX on non-orderable custom type columns and STRUCT/UNION columns
     for col in &columns {
@@ -913,11 +920,24 @@ fn index_matches_collation(index: &Index, collation: CollationSeq) -> bool {
         .any(|column| column.collation.unwrap_or_default() == collation)
 }
 
+/// Which functions an index expression may call.
+#[derive(Clone, Copy)]
+enum IndexFunctions<'a> {
+    /// Deterministic built-in functions.
+    CreateIndex,
+    /// For an index read back from sqlite_schema. Like SQLite, a function Turso
+    /// does not know is accepted, so the rest of the file stays usable, and
+    /// statements that must compute the index key fail with "no such function".
+    /// Extension functions Turso does know must be deterministic.
+    StoredSchema(&'a SymbolTable),
+}
+
 pub fn resolve_sorted_columns(
+    syms: &SymbolTable,
     table: &BTreeTable,
     cols: &[SortedColumn],
 ) -> crate::Result<crate::alloc::Vec<IndexColumn>> {
-    resolve_sorted_columns_with_resolver(table, cols, None)
+    resolve_sorted_columns_with_resolver(table, cols, None, IndexFunctions::StoredSchema(syms))
 }
 
 pub fn reject_explicit_nulls(cols: &[SortedColumn]) -> crate::Result<()> {
@@ -933,6 +953,7 @@ fn resolve_sorted_columns_with_resolver(
     table: &BTreeTable,
     cols: &[SortedColumn],
     resolver: Option<&Resolver>,
+    functions: IndexFunctions,
 ) -> crate::Result<crate::alloc::Vec<IndexColumn>> {
     let mut resolved =
         <crate::alloc::Vec<_> as crate::alloc::TursoTryWithCapacityExt>::try_with_capacity_ext(
@@ -963,7 +984,7 @@ fn resolve_sorted_columns_with_resolver(
                 .expect("resolved index columns vector was preallocated to cols.len()");
             continue;
         }
-        if !validate_index_expression(unwrapped_expr, table) {
+        if !validate_index_expression(unwrapped_expr, table, functions) {
             crate::bail_parse_error!("Error: invalid expression in CREATE INDEX: {}", sc.expr);
         }
         resolved
@@ -1052,7 +1073,7 @@ fn resolve_index_column<'a>(
 /// Expressions in CREATE INDEX statements may not use subqueries.
 /// Additionally, a standalone string literal is interpreted as a column name (for backwards
 /// compatibility with SQLite), not as a string literal. It is rejected if no such column exists.
-fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
+fn validate_index_expression(expr: &Expr, table: &BTreeTable, functions: IndexFunctions) -> bool {
     // A top-level string literal would have been handled by resolve_index_column().
     // If we get here with a string literal, it means the column doesn't exist.
     // (SQLite interprets standalone string literals as column names for backwards compat.)
@@ -1070,10 +1091,18 @@ fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
             .any(|c| c.name.as_ref().is_some_and(|cn| normalize_ident(cn) == n))
     };
     let is_tbl = |ns: &str| normalize_ident(ns).eq_ignore_ascii_case(&tbl_norm);
-    let is_deterministic_fn = |name: &str, args: &[Box<Expr>]| {
+    let is_allowed_fn = |name: &str, args: &[Box<Expr>]| {
         let n = normalize_ident(name);
-        Func::resolve_function(&n, args.len())
-            .is_ok_and(|f| f.is_some_and(|f| is_deterministic_schema_function_call(&f, args)))
+        match Func::resolve_function(&n, args.len()) {
+            Ok(Some(f)) => is_deterministic_schema_function_call(&f, args),
+            Ok(None) => match functions {
+                IndexFunctions::CreateIndex => false,
+                IndexFunctions::StoredSchema(syms) => syms
+                    .resolve_function(&n, args.len())
+                    .is_none_or(|f| f.is_deterministic()),
+            },
+            Err(_) => false,
+        }
     };
 
     let mut ok = true;
@@ -1120,7 +1149,7 @@ fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
                         Expr::FunctionCallStar { .. } => &[] as &[Box<Expr>],
                         _ => unreachable!(),
                     };
-                    if !is_deterministic_fn(name.as_str(), argc) {
+                    if !is_allowed_fn(name.as_str(), argc) {
                         ok = false;
                     }
                 }
